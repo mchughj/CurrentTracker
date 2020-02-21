@@ -22,7 +22,6 @@
 #define SCREEN_HEIGHT 128 
 
 #define COULOMB_INTERRUPT_PIN 3
-#define LED_PIN    13
 
 #define SCREEN_DC   8
 #define SCREEN_CS   9
@@ -44,9 +43,13 @@ Adafruit_SSD1351 tft = Adafruit_SSD1351(SCREEN_CS, SCREEN_DC, SCREEN_RST);
 #define ULONG_MAX 0xFFFFFFFF
 
 // The Arduino Zero has two serial ports.  To get output for debugging I use
-// the Serial rather than Serial.
+// the SerialUSB rather than Serial.
 #define Serial SerialUSB
 
+// The Arduino zero has an ARM Cortex M0+ processor with 256KB of flash (and a
+// pretty hefty 32KB of SRAM).  Not having printf in the core is a little
+// silly and my debug information in the below is non-trivial.  So I've
+// defined my on printf equivalent. 
 void myPrintf(const char * format, ...)
 {
   char buf[256];
@@ -61,9 +64,11 @@ void myPrintf(const char * format, ...)
   va_end(ap);
 }
 
-class CurrentDatapoints {
+class DurationAdaptiveAverageTracker {
 public:
-  CurrentDatapoints(int numberToTrack);
+  // Allocate the duration adaptive tracker with the specified number of data
+  // elements to track.  Each element takes 5 bytes of space.
+  DurationAdaptiveAverageTracker(int numberToTrack);
 
   void addData(unsigned long int timeMicros, uint8_t numberOfInterrupts);
 
@@ -92,7 +97,7 @@ private:
 };
 
 
-CurrentDatapoints::CurrentDatapoints(int numberToTrack) { 
+DurationAdaptiveAverageTracker::DurationAdaptiveAverageTracker(int numberToTrack) { 
   allocatedDatapoints = numberToTrack;
   numberDatapoints = 0;
   nextIndex = 0;
@@ -103,7 +108,7 @@ CurrentDatapoints::CurrentDatapoints(int numberToTrack) {
 }
 
 
-void CurrentDatapoints::addData(unsigned long int timeMicros, uint8_t numberOfInterrupts) {
+void DurationAdaptiveAverageTracker::addData(unsigned long int timeMicros, uint8_t numberOfInterrupts) {
   if (lastMicrosSeen != 0) { 
     unsigned long int microsElapsed = getElapsed(lastMicrosSeen, timeMicros);
     totalSeconds += ((double)microsElapsed) / 1000000.0;
@@ -133,7 +138,7 @@ void CurrentDatapoints::addData(unsigned long int timeMicros, uint8_t numberOfIn
 }
 
 double
-CurrentDatapoints::getApproximateAverage( unsigned long int currentMicros, unsigned long int microDuration ) {
+DurationAdaptiveAverageTracker::getApproximateAverage( unsigned long int currentMicros, unsigned long int microDuration ) {
   unsigned long int maxPastTimeMicros = 0;
   uint8_t interruptsAccumulated = 0;
 
@@ -186,7 +191,7 @@ CurrentDatapoints::getApproximateAverage( unsigned long int currentMicros, unsig
   // stop consuming battery then the larger durations will still show an
   // average value but the smaller ones will not.
   unsigned long int totalDurationMicros = getElapsed(maxPastTimeMicros, currentMicros);
-  if (totalDurationMicros < microDuration * 0.85) { 
+  if (totalDurationMicros < microDuration * 0.80) { 
     myPrintf( "getApproximateAverage - returning insufficient data; "
               "microDuration: %lu, totalDurationMicros: %lu, difference: %lu\n", 
               microDuration, totalDurationMicros, 
@@ -203,7 +208,7 @@ CurrentDatapoints::getApproximateAverage( unsigned long int currentMicros, unsig
 }
 
 double 
-CurrentDatapoints::getOverallAverage() {
+DurationAdaptiveAverageTracker::getOverallAverage() {
   if (totalSeconds==0) { 
     return -1;
   }
@@ -213,7 +218,7 @@ CurrentDatapoints::getOverallAverage() {
 // Return the number of elapsed microseconds that have occurred between time
 // laterMicros and earlierMicros.  
 unsigned long int 
-CurrentDatapoints::getElapsed( unsigned long int earlierMicros, unsigned long int laterMicros) {
+DurationAdaptiveAverageTracker::getElapsed( unsigned long int earlierMicros, unsigned long int laterMicros) {
   unsigned long int result;
   // earlierMicros is assumed to the be the 'earlier' time but time may have wrapped
   // around.
@@ -233,6 +238,192 @@ CurrentDatapoints::getElapsed( unsigned long int earlierMicros, unsigned long in
   return result;
 }
 
+
+class GraphMilliAmpsAverageStats {
+public:
+  GraphMilliAmpsAverageStats(Adafruit_GFX &display, int topLeftX, int topLeftY, int width, int height);
+
+  /**
+   * call addDatasetValue whenever a value is available. 
+   */
+  void addDatasetValue(float deltaSecondsElapsed, float averagemAh);
+
+  /**
+   * call startRender a single time before the first call to render.
+   */
+  void startRender();
+
+  /**
+   * render will draw the average of all values passed in between this
+   * call and the prior render.  If no data values are provided then
+   * it assumed that the 0 is the latest value and render the graph
+   * based on that.
+   */
+  void render();
+
+private:
+
+  uint8_t statsWidth();
+  uint8_t statsHeight();
+  uint8_t statsTopLeftX();
+  uint8_t statsTopLeftY();
+
+  Adafruit_GFX& display;
+  uint16_t topLeftX, topLeftY;
+  uint16_t width, height;
+
+  float secondsToShow = 60;
+  float pixelRatioForTime;
+  float pixelRatioFormAh;
+
+  int currentX;
+
+  uint8_t borderX;
+  uint8_t borderY;
+
+  bool newDataPoint;
+  float nextDeltaSecondsElapsed;
+  float nextAveragemAh;
+
+  float maxmAh;
+};
+  
+
+GraphMilliAmpsAverageStats::GraphMilliAmpsAverageStats(Adafruit_GFX &d, 
+    int topLeftX, int topLeftY, int width, int height) : display(d) {
+  this->topLeftX = topLeftX;
+  this->topLeftY = topLeftY;
+  this->width = width;
+  this->height = height;
+
+  newDataPoint = false;
+  maxmAh = 400;
+
+  borderX = 4;
+  borderY = 4;
+
+  pixelRatioForTime = (double)(statsWidth()) / ((double)secondsToShow);
+  pixelRatioFormAh = (double)(statsHeight()) / ((double)maxmAh);
+
+  currentX = 0;
+}
+
+void
+GraphMilliAmpsAverageStats::addDatasetValue(float deltaSecondsElapsed, float averagemAh) {
+  nextDeltaSecondsElapsed = deltaSecondsElapsed;
+  nextAveragemAh = averagemAh;
+  newDataPoint = true;
+}
+
+uint8_t 
+GraphMilliAmpsAverageStats::statsWidth() {
+  return width - borderX;
+}
+
+uint8_t 
+GraphMilliAmpsAverageStats::statsHeight() {
+  return height - borderY;
+}
+
+uint8_t 
+GraphMilliAmpsAverageStats::statsTopLeftX() { 
+  return topLeftX + borderX;
+}
+
+uint8_t 
+GraphMilliAmpsAverageStats::statsTopLeftY() { 
+  return topLeftY;
+}
+
+void 
+GraphMilliAmpsAverageStats::startRender() {
+  // Clear the area
+  display.fillRect(topLeftX, topLeftY, width, height, BLACK);
+  display.drawFastHLine(topLeftX, topLeftY + height - (borderY-1), width, RED);
+  display.drawFastVLine(topLeftX+(borderX-1), topLeftY, height, RED);
+}
+
+void
+GraphMilliAmpsAverageStats::render() { 
+  if (newDataPoint) { 
+    int w = nextDeltaSecondsElapsed * pixelRatioForTime;
+    int h = nextAveragemAh * pixelRatioFormAh;
+
+    if (h > statsHeight()) { 
+      h = statsHeight();
+    }
+    if (w > statsWidth()) {
+      w = statsWidth();
+    }
+    
+    // Clear the space at this position as well as beyond. 
+    display.fillRect(statsTopLeftX() + currentX, statsTopLeftY(), 25, statsHeight(), BLACK);
+
+    // Draw the actual datapoint
+    display.fillRect(statsTopLeftX() + currentX, statsTopLeftY() + (statsHeight()-h), w, h, BLUE);
+
+    currentX += w + 1;
+    if (currentX + 3 >= statsWidth()) { 
+      currentX = 0;
+    } else {
+      // Draw the indicator showing where we are.
+      for (int y=0; y<statsHeight(); y+=5) { 
+        uint8_t lineHeight = 3;
+        if (y + lineHeight > statsHeight()) { 
+          lineHeight = statsHeight() - y;
+        }
+        display.drawFastVLine(statsTopLeftX() + currentX, statsTopLeftY() + y, lineHeight, YELLOW);
+      }
+    }
+    newDataPoint = false;
+  }
+}
+
+
+class SmartStatDisplay {
+public:
+  SmartStatDisplay(Adafruit_GFX &display, int topLeftX, int topLeftY, int width, int height);
+
+  /*
+   * render the value within the slot that has been defined for this element.
+   * If the value has not changed then this won't do any work.
+   */
+  void render(float value);
+
+private:
+  Adafruit_GFX& display;
+  uint16_t topLeftX, topLeftY;
+  uint16_t width, height;
+
+  bool firstValue;
+  float priorValue;
+};
+
+SmartStatDisplay::SmartStatDisplay(Adafruit_GFX &d, 
+    int topLeftX, int topLeftY, int width, int height) : display(d) {
+  this->topLeftX = topLeftX;
+  this->topLeftY = topLeftY;
+  this->width = width;
+  this->height = height;
+
+  firstValue = true;
+  priorValue = 0;
+}
+
+void
+SmartStatDisplay::render(float value) { 
+  if (firstValue == true || priorValue != value ) {
+
+    // Clear the space for this element
+    display.fillRect(topLeftX, topLeftY, width, height, BLACK);
+
+    display.setCursor(topLeftX, topLeftY);
+    display.print(value);
+
+    priorValue = value;
+    firstValue = false;
+  }
+}
 
 
 // Track two micro times.  The first, startZeroInterruptMicros, is set during the main
@@ -256,7 +447,14 @@ unsigned int totalNumberOfInterrupts;
 double averagemAh;
 double totalConsumedmAh;
 
-CurrentDatapoints c(200);
+DurationAdaptiveAverageTracker t(200);
+GraphMilliAmpsAverageStats *g;
+SmartStatDisplay *statmAh;
+SmartStatDisplay *statTotalmAh;
+SmartStatDisplay *statOverallAvgmAh;
+SmartStatDisplay *stat20SecAvgmAh;
+SmartStatDisplay *stat60SecAvgmAh;
+SmartStatDisplay *stat120SecAvgmAh;
 
 void interruptForCoulomb() {
   mostRecentInterruptMicros = micros();
@@ -266,12 +464,9 @@ void interruptForCoulomb() {
 void setup() {
   Serial.begin(9600);
 
-  // Illuminate status LED_PIN.
-  pinMode(LED_PIN, INPUT_PULLUP); 
-     
   // Initialize the OLED
   tft.begin();
-  tft.fillRect(0, 0, 128, 128, BLACK);
+  tft.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, BLACK);
 
   // Initialize the interrupt pin used to receive pulses from the
   // Sparkfun coulomb counter.
@@ -288,6 +483,43 @@ void setup() {
   totalNumberOfInterrupts = 0;
 
   startTime = millis();
+
+  tft.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, BLACK);
+  g = new GraphMilliAmpsAverageStats( tft, 5, 2, SCREEN_WIDTH - (5*2), 50 );
+  g->startRender();
+
+  statmAh = new SmartStatDisplay(tft, 40, 53, 42, 8);
+  statTotalmAh = new SmartStatDisplay(tft, 40, 63, 42, 8);
+  statOverallAvgmAh = new SmartStatDisplay(tft, 71, 87, 42, 8);
+  stat20SecAvgmAh = new SmartStatDisplay(tft, 71, 97, 42, 8);
+  stat60SecAvgmAh = new SmartStatDisplay(tft, 71, 107, 42, 8);
+  stat120SecAvgmAh = new SmartStatDisplay(tft, 71, 117, 42, 8);
+
+  tft.setCursor(12,53);
+  tft.setTextColor(WHITE);
+  tft.print("mAh:");
+
+  tft.setCursor(0,63);
+  tft.print("Total:");
+
+  tft.fillRect(2, 73, SCREEN_WIDTH-4, 1, YELLOW);
+  tft.setCursor(30,75);
+  tft.setTextColor(YELLOW);
+  tft.print("Average mAhs");
+
+  tft.setCursor(19,87);
+  tft.setTextColor(WHITE);
+  tft.print("Overall: ");
+
+  tft.setCursor(19,97);
+  tft.print("20 secs: ");
+
+  tft.setCursor(19,107);
+  tft.print("60 secs: ");
+
+  tft.setCursor(13,117);
+  tft.print("120 secs: ");
+
   Serial.println("setup complete!");
 }
 
@@ -295,7 +527,7 @@ double secondsBetweenInterrupts = 0;
 
 void loop() {
   if (numberOfInterrupts) {
-    c.addData(micros(), numberOfInterrupts);
+    t.addData(micros(), numberOfInterrupts);
 
     secondsBetweenInterrupts = (mostRecentInterruptMicros-startZeroInterruptMicros)/1000000.0;
     averagemAh = (614.4 * numberOfInterrupts)/secondsBetweenInterrupts; 
@@ -304,38 +536,20 @@ void loop() {
     totalNumberOfInterrupts += numberOfInterrupts;
     startZeroInterruptMicros = micros();
     numberOfInterrupts = 0;
+
+    g->addDatasetValue(secondsBetweenInterrupts, averagemAh);
   }
-
-  unsigned long int currentTime = millis();
-
-  tft.fillRect(0, 0, 128, 128, BLACK);
-  tft.setCursor(0,0);
-  tft.setTextColor(WHITE);
-  tft.print( "Seconds: ");
-  tft.println( (int) ((currentTime - startTime) / 1000));
-  tft.println();
-
-  tft.print("Interrupts: ");
-  tft.println(totalNumberOfInterrupts);
-  tft.print("Avg mAh: ");
-  tft.println(averagemAh);
-  tft.print("  (");
-  tft.print(secondsBetweenInterrupts);
-  tft.println(" secs)");
-  tft.print("Total mAh: ");
-  tft.println(totalConsumedmAh);
-  tft.println("---");
-  tft.print("C-Overall: ");
-  tft.println(c.getOverallAverage());
   unsigned long int currentMicros = micros();
-  tft.print("C-20s: ");
-  tft.println(c.getApproximateAverage(currentMicros, 20 * 1000 * 1000));
-  tft.print("C-60s: ");
-  tft.println(c.getApproximateAverage(currentMicros, 60 * 1000 * 1000));
-  tft.print("C-120s: ");
-  tft.println(c.getApproximateAverage(currentMicros, 120 * 1000 * 1000));
-  tft.print("C-360s: ");
-  tft.println(c.getApproximateAverage(currentMicros, 360 * 1000 * 1000));
+
+  statmAh->render(averagemAh);
+  statTotalmAh->render(totalConsumedmAh);
+  statOverallAvgmAh->render(t.getOverallAverage());
+  stat20SecAvgmAh->render(t.getApproximateAverage(currentMicros, 20 * 1000 * 1000));
+  stat60SecAvgmAh->render(t.getApproximateAverage(currentMicros, 60 * 1000 * 1000));
+  stat120SecAvgmAh->render(t.getApproximateAverage(currentMicros, 120 * 1000 * 1000));
+
+  g->render();
+
   delay(2000);
 }
 
